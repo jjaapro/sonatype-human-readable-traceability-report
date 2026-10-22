@@ -1,0 +1,112 @@
+# CVE reachability report in GitLab CI
+#
+#   sonatype-scan-input      builds the service and collects its JARs
+#   sonatype-evaluate        Sonatype Lifecycle scan with Java reachability analysis
+#   cve-reachability-report  one row per CVE with Vulnerability, CVSS, Component,
+#                            Sonatype Reachability and Evidence (HTML and CSV, linked
+#                            from merge requests). Fails when a CVE marked Reachable has
+#                            no evidence in security/cve-evidence.toml, and lists those
+#                            CVEs in the merge request test widget.
+#
+# Setup
+#   1. Settings > CI/CD > Variables:
+#        NEXUS_IQ_URL       IQ Server URL that the runner can reach
+#        NEXUS_IQ_USERNAME  IQ user, or a user token's user code, with the Evaluate
+#                           Applications and View IQ Elements permissions on the app
+#        NEXUS_IQ_PASSWORD  its password, or the token's passcode (masked)
+#      An IQ Server on a laptop is only reachable from a runner on that laptop:
+#      register one there and add its tag to the two Sonatype jobs.
+#
+#   2. Add this task to the service's build.gradle.kts. It collects the app JAR and
+#      its runtime dependencies as plain JARs, which is what reachability analysis
+#      needs (it does not run on container images):
+#
+#        tasks.register<Sync>("sonatypeScanInput") {
+#            from(tasks.named("jar"))
+#            from(configurations.named("runtimeClasspath"))
+#            into(layout.buildDirectory.dir("sonatype-scan"))
+#        }
+#
+#      Spring Boot builds: keep the plain `jar` task enabled.
+#
+#   3. Commit ci/reachability_report.py and security/cve-evidence.toml, then add to
+#      .gitlab-ci.yml:
+#
+#        include:
+#          - local: ci/sonatype-reachability.gitlab-ci.yml
+#
+#      The jobs use the default build and test stages.
+
+variables:
+  SONATYPE_APP_ID: example-app           # application public ID in Sonatype
+  SONATYPE_NAMESPACE: com.example        # top-level package of your own code
+
+sonatype-scan-input:
+  stage: build
+  image: eclipse-temurin:21-jdk          # match your project's JDK
+  variables:
+    GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle
+  cache:
+    key: gradle
+    paths:
+      - .gradle/caches/
+      - .gradle/wrapper/
+  script:
+    - ./gradlew --no-daemon sonatypeScanInput
+  artifacts:
+    paths:
+      - build/sonatype-scan/             # multi-module: <module>/build/sonatype-scan/
+    expire_in: 1 day
+
+sonatype-evaluate:
+  stage: test
+  image: sonatype/gitlab-nexus-iq-pipeline:latest   # pin a version or digest once this works
+  needs: [sonatype-scan-input]
+  script:
+    # Reads NEXUS_IQ_URL, NEXUS_IQ_USERNAME and NEXUS_IQ_PASSWORD. The job fails when a
+    # Sonatype policy action is Fail; the report job still runs.
+    - >
+      /sonatype/evaluate
+      --application-id "$SONATYPE_APP_ID"
+      --result-file scan-result.json
+      --reachability-analysis
+      --reachability-analysis-namespaces "$SONATYPE_NAMESPACE"
+      --reachability-result-file reachability-result.json
+      build/sonatype-scan
+  artifacts:
+    when: always
+    paths:
+      - scan-result.json
+      - reachability-result.json         # Sonatype's raw reachability output, kept for audits
+    expire_in: 90 days
+
+cve-reachability-report:
+  stage: test
+  image: python:3.12-slim
+  needs:
+    - job: sonatype-evaluate
+      artifacts: true
+  when: always                           # report even when the Sonatype policy failed the scan
+  script:
+    # Fails (exit 2) when a CVE marked Reachable has no evidence; the job log prints an
+    # entry to paste into the evidence file for each one. Also fails (exit 1) when
+    # Sonatype's reachability could not be read, because the rule can't be checked then.
+    # While the team fills in the evidence file for the first time, you can add
+    # "allow_failure: true" to this job so it only warns.
+    - >
+      python3 ci/reachability_report.py
+      --result scan-result.json
+      --evidence-file security/cve-evidence.toml
+      --out reachability-report
+      --require-evidence
+  artifacts:
+    when: always
+    expose_as: "CVE reachability report"
+    paths:
+      - reachability-report/
+    reports:
+      junit: reachability-report/junit.xml
+    expire_in: 90 days
+
+# GitLab Ultimate: Sonatype's create-vulnerability-report CI component can also send
+# the findings to the project's Vulnerability Report and Dependency List.
